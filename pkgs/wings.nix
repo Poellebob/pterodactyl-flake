@@ -1,9 +1,8 @@
 { lib, stdenvNoCC, fetchurl, ... }:
 
-# To update: change `version`, then replace `hash` with lib.fakeHash,
-# run `nix build .#wingsPackage` and copy the real hash from the error.
 let
   version = "1.11.13";
+  hash = "sha256-06ppifap4pklcb6aldqwz6lkz2hdja5pbp8n5h4hzhgivm2zm9dc";
 in
 stdenvNoCC.mkDerivation {
   pname = "wings";
@@ -11,8 +10,7 @@ stdenvNoCC.mkDerivation {
 
   src = fetchurl {
     url = "https://github.com/pterodactyl/wings/releases/download/v${version}/wings_linux_amd64";
-    # Run: nix-prefetch-url https://github.com/pterodactyl/wings/releases/download/v${version}/wings_linux_amd64
-    hash = "sha256-AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=";
+    hash = hash;
   };
 
   dontUnpack = true;

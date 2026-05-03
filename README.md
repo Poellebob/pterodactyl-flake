@@ -1,6 +1,6 @@
 # pterodactyl-flake
 
-NixOS flake for running Pterodactyl panel + Wings on a single machine.
+NixOS flake for running Pterodactyl panel + Wings on a single machine, with automated panel setup.
 
 ---
 
@@ -36,7 +36,6 @@ NixOS flake for running Pterodactyl panel + Wings on a single machine.
 ### 2. Configure the modules
 
 ```nix
-# hosts/myserver/configuration.nix
 { config, ... }:
 {
   services.pterodactyl = {
@@ -44,8 +43,14 @@ NixOS flake for running Pterodactyl panel + Wings on a single machine.
     domain  = "panel.example.com";
     useACME = true;
 
-    # Optional — point at a plain file or an agenix secret:
-    # dbPasswordFile = "/run/agenix/ptero-db-password";
+    # Optional — customize database, redis, and admin settings:
+    # database.passwordFile = "/run/agenix/ptero-db-password";
+    # database.host = "127.0.0.1";  # default
+    # database.port = 3306;          # default
+    # redis.host = "127.0.0.1";     # default
+    # redis.port = 6379;            # default
+    # admin.emailFile = "/run/agenix/ptero-admin-email";
+    # admin.passwordFile = "/run/agenix/ptero-admin-password";
   };
 
   services.wings = {
@@ -56,50 +61,46 @@ NixOS flake for running Pterodactyl panel + Wings on a single machine.
 }
 ```
 
-### 3. Lock and switch
-
-```bash
-nix flake lock          # resolves the new input
-nixos-rebuild switch --flake .#myserver
-```
-
 ---
 
-## One-time panel setup
+## Automated panel setup
 
-Run these **once** after the first successful `nixos-rebuild switch`.
-All commands run as the `pterodactyl` system user.
+The panel setup runs **automatically** via `pterodactyl-setup` systemd service. The setup is **idempotent** and **config-aware**:
 
-```bash
-# 1. Download and extract the panel release
-sudo mkdir -p /srv/pterodactyl
-sudo chown pterodactyl:pterodactyl /srv/pterodactyl
-cd /srv/pterodactyl
+- **First boot**: Downloads panel, configures environment, creates admin user
+- **Config changes**: When you change `domain`, `timezone`, `database.*`, `redis.*`, or `admin.*` options, NixOS automatically re-runs the setup to apply changes
+- **Safe re-runs**: Already-completed steps (download, key generation, admin creation) are skipped on subsequent runs
 
-sudo -u pterodactyl curl -Lo panel.tar.gz \
-  https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz
-sudo -u pterodactyl tar --strip-components=1 -xzf panel.tar.gz
-sudo -u pterodactyl rm panel.tar.gz
+### Initial setup
 
-# 2. Install PHP dependencies
-sudo -u pterodactyl composer install --no-dev --optimize-autoloader
+Configure the required options and rebuild:
 
-# 3. Generate the app key + configure environment
-sudo -u pterodactyl php artisan key:generate --force
-sudo -u pterodactyl php artisan p:environment:setup
-sudo -u pterodactyl php artisan p:environment:database
-
-# 4. Run migrations and seed default data
-sudo -u pterodactyl php artisan migrate --seed --force
-
-# 5. Create the first admin account
-sudo -u pterodactyl php artisan p:user:make
-
-# 6. Fix permissions
-sudo chown -R pterodactyl:pterodactyl /srv/pterodactyl
-sudo chmod -R 755 /srv/pterodactyl/storage \
-                  /srv/pterodactyl/bootstrap/cache
+```nix
+services.pterodactyl = {
+  enable = true;
+  domain  = "panel.example.com";
+  admin.emailFile = "/run/agenix/ptero-admin-email";
+  admin.passwordFile = "/run/agenix/ptero-admin-password";
+  # Optional: database.passwordFile = "/run/agenix/ptero-db-password";
+};
 ```
+
+After `nixos-rebuild switch && reboot` (or just `nixos-rebuild switch` if already running), check:
+```bash
+systemctl status pterodactyl-setup
+journalctl -u pterodactyl-setup -f
+```
+
+### Automatic re-setup on config changes
+
+When you modify relevant configuration (domain, database settings, redis settings, admin settings), the setup service automatically re-runs on next `nixos-rebuild switch`:
+
+```nix
+# Example: Change domain - setup will re-run automatically
+services.pterodactyl.domain = "new-panel.example.com";
+```
+
+No manual intervention needed - NixOS handles everything through the config hash mechanism.
 
 ---
 
@@ -127,7 +128,6 @@ services.wings.configFile = "/etc/pterodactyl/config.yml";
 6. Rebuild and restart Wings:
 
 ```bash
-nixos-rebuild switch --flake .#myserver
 sudo systemctl restart wings
 sudo systemctl status wings
 ```
@@ -139,7 +139,6 @@ sudo systemctl status wings
 If you are already using agenix, encrypt both secrets and reference them instead of plain paths.
 
 ```bash
-# Encrypt the DB password
 printf 'supersecretpassword' \
   | rage -r "$(cat /etc/ssh/ssh_host_ed25519_key.pub)" \
   > secrets/ptero-db-password.age
@@ -166,6 +165,14 @@ agenix = {
     file  = ./secrets/ptero-db-password.age;
     owner = "pterodactyl";
   };
+  age.secrets."ptero-admin-email" = {
+    file  = ./secrets/ptero-admin-email.age;
+    owner = "pterodactyl";
+  };
+  age.secrets."ptero-admin-password" = {
+    file  = ./secrets/ptero-admin-password.age;
+    owner = "pterodactyl";
+  };
   age.secrets."wings-config" = {
     file  = ./secrets/wings-config.age;
     owner = "root";
@@ -173,9 +180,11 @@ agenix = {
   };
 
   services.pterodactyl = {
-    enable         = true;
-    domain         = "panel.example.com";
-    dbPasswordFile = config.age.secrets."ptero-db-password".path;
+    enable = true;
+    domain = "panel.example.com";
+    database.passwordFile = config.age.secrets."ptero-db-password".path;
+    admin.emailFile = config.age.secrets."ptero-admin-email".path;
+    admin.passwordFile = config.age.secrets."ptero-admin-password".path;
   };
 
   services.wings = {
@@ -202,17 +211,44 @@ services.wings.package = pkgs.callPackage ./my-wings-override.nix {};
 
 ### `services.pterodactyl`
 
+#### Top-level options
+
 | Option | Type | Default | Description |
 |---|---|---|---|
 | `enable` | bool | `false` | Enable the panel |
 | `domain` | str | — | Public domain / Nginx vhost |
 | `useACME` | bool | `true` | Auto-provision Let's Encrypt cert |
 | `dataDir` | str | `/srv/pterodactyl` | Panel file location |
+| `timezone` | str | `UTC` | Timezone for the panel |
 | `user` | str | `pterodactyl` | System user for php-fpm + queue worker |
-| `redisName` | str | `pterodactyl` | Redis server instance name |
-| `dbName` | str | `pterodactyl` | MariaDB database name |
-| `dbUser` | str | `pterodactyl` | MariaDB user |
-| `dbPasswordFile` | path\|null | `null` | File containing the DB password |
+
+#### `services.pterodactyl.database`
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `name` | str | `pterodactyl` | MariaDB database name |
+| `user` | str | `pterodactyl` | MariaDB user |
+| `passwordFile` | path\|null | `null` | File containing the DB password |
+| `host` | str | `127.0.0.1` | MariaDB host address |
+| `port` | port | `3306` | MariaDB port |
+
+#### `services.pterodactyl.redis`
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `name` | str | `pterodactyl` | Redis server instance name |
+| `host` | str | `127.0.0.1` | Redis host address |
+| `port` | port | `6379` | Redis port |
+
+#### `services.pterodactyl.admin`
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `emailFile` | path | — | File containing admin e-mail (required) |
+| `passwordFile` | path | — | File containing admin password (required) |
+| `username` | str | `admin` | Initial admin username |
+| `firstName` | str | `Panel` | Initial admin first name |
+| `lastName` | str | `Admin` | Initial admin last name |
 
 ### `services.wings`
 

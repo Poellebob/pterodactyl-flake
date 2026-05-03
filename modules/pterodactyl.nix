@@ -5,7 +5,6 @@ with lib;
 let
   cfg = config.services.pterodactyl;
 
-  # PHP 8.1 with all extensions Pterodactyl needs.
   pteroPhp = pkgs.php81.buildEnv {
     extensions = { enabled, all, ... }: enabled ++ (with all; [
       redis
@@ -26,6 +25,107 @@ let
   };
 
   pteroComposer = pkgs.php81Packages.composer.override { php = pteroPhp; };
+
+  # Hash of relevant config - changes when panel config changes, triggering re-setup
+  relevantConfig = {
+    domain = cfg.domain;
+    timezone = cfg.timezone;
+    database = { inherit (cfg.database) name user host port; };
+    redis = { inherit (cfg.redis) name host port; };
+    admin = { inherit (cfg.admin) username firstName lastName; };
+  };
+  configHash = builtins.substring 0 8 (builtins.hashString "sha256" (builtins.toJSON relevantConfig));
+  markerFile = "${cfg.dataDir}/.setup-done-${configHash}";
+
+  appUrl = if cfg.useACME then "https://${cfg.domain}" else "http://${cfg.domain}";
+
+  setupScript = pkgs.writeShellScript "pterodactyl-setup" ''
+    set -euo pipefail
+
+    PHP="${pteroPhp}/bin/php"
+    COMPOSER="${pteroComposer}/bin/composer"
+    ARTISAN="$PHP ${cfg.dataDir}/artisan"
+
+    # Download and extract panel only if not already present
+    if [ ! -f "${cfg.dataDir}/artisan" ]; then
+      echo "pterodactyl-setup: downloading panel..."
+      mkdir -p "${cfg.dataDir}"
+      ${pkgs.curl}/bin/curl -fsSL \
+        https://github.com/pterodactyl/panel/releases/latest/download/panel.tar.gz \
+        -o /tmp/pterodactyl-panel.tar.gz
+
+      tar --strip-components=1 -xzf /tmp/pterodactyl-panel.tar.gz -C "${cfg.dataDir}"
+      rm /tmp/pterodactyl-panel.tar.gz
+
+      echo "pterodactyl-setup: running composer install..."
+      cd "${cfg.dataDir}"
+      HOME="${cfg.dataDir}" \
+        COMPOSER_HOME="${cfg.dataDir}/.composer" \
+        $COMPOSER install --no-dev --optimize-autoloader --no-interaction
+    else
+      echo "pterodactyl-setup: panel already present, skipping download."
+    fi
+
+    DB_PASSWORD=""
+    ${optionalString (cfg.database.passwordFile != null) ''
+      DB_PASSWORD=$(cat "${cfg.database.passwordFile}")
+    ''}
+    ADMIN_PASSWORD=$(cat "${cfg.admin.passwordFile}")
+    ADMIN_EMAIL=$(cat "${cfg.admin.emailFile}")
+
+    # Generate app key only if not already set
+    if ! grep -q "^APP_KEY=" "${cfg.dataDir}/.env" 2>/dev/null; then
+      echo "pterodactyl-setup: generating app key..."
+      $ARTISAN key:generate --force
+    else
+      echo "pterodactyl-setup: app key already exists, skipping."
+    fi
+
+    echo "pterodactyl-setup: configuring environment..."
+    $ARTISAN p:environment:setup \
+      --no-interaction \
+      --author="$ADMIN_EMAIL" \
+      --url="${appUrl}" \
+      --timezone="${cfg.timezone}" \
+      --cache=redis \
+      --session=redis \
+      --queue=redis \
+      --redis-host=${cfg.redis.host} \
+      --redis-port=${cfg.redis.port}
+
+    echo "pterodactyl-setup: configuring database..."
+    $ARTISAN p:environment:database \
+      --no-interaction \
+      --host=${cfg.database.host} \
+      --port=${cfg.database.port} \
+      --database="${cfg.database.name}" \
+      --username="${cfg.database.user}" \
+      --password="$DB_PASSWORD"
+
+    echo "pterodactyl-setup: running migrations..."
+    $ARTISAN migrate --seed --force
+
+    # Create admin user only if APP_KEY exists (indicates setup was done)
+    if [ ! -f "${cfg.dataDir}/.env" ] || ! grep -q "^APP_KEY=" "${cfg.dataDir}/.env" 2>/dev/null; then
+      echo "pterodactyl-setup: creating admin user..."
+      $ARTISAN p:user:make \
+        --no-interaction \
+        --email="$ADMIN_EMAIL" \
+        --username="${cfg.admin.username}" \
+        --name-first="${cfg.admin.firstName}" \
+        --name-last="${cfg.admin.lastName}" \
+        --password="$ADMIN_PASSWORD" \
+        --admin=1
+    else
+      echo "pterodactyl-setup: admin user likely exists, skipping creation."
+    fi
+
+    chown -R "${cfg.user}:${cfg.user}" "${cfg.dataDir}"
+    chmod -R 755 "${cfg.dataDir}/storage" "${cfg.dataDir}/bootstrap/cache"
+
+    touch "${markerFile}"
+    echo "pterodactyl-setup: complete."
+  '';
 in {
   options.services.pterodactyl = {
     enable = mkEnableOption "Pterodactyl panel";
@@ -33,31 +133,26 @@ in {
     domain = mkOption {
       type    = types.str;
       example = "panel.example.com";
-      description = mdDoc ''
-        Public domain (or IP) for the panel.
-        Used as the Nginx `server_name` and, when `useACME` is true,
-        as the Let's Encrypt certificate domain.
-      '';
+      description = mdDoc "Public domain for the panel. Used as Nginx server_name and ACME cert domain.";
     };
 
     useACME = mkOption {
       type    = types.bool;
       default = true;
-      description = mdDoc ''
-        Whether to provision a Let's Encrypt certificate via ACME.
-        Set to false if you are behind a reverse proxy that already terminates TLS,
-        or if you want to bring your own certificate.
-      '';
+      description = mdDoc "Provision a Let's Encrypt cert. Set false if TLS is terminated upstream.";
     };
 
     dataDir = mkOption {
       type    = types.str;
       default = "/srv/pterodactyl";
-      example = "/var/www/pterodactyl";
-      description = mdDoc ''
-        Directory where the Pterodactyl panel files live.
-        After deploying, run the one-time setup described in README.md.
-      '';
+      description = mdDoc "Directory where the panel files will be extracted to.";
+    };
+
+    timezone = mkOption {
+      type    = types.str;
+      default = "UTC";
+      example = "Europe/Copenhagen";
+      description = mdDoc "Timezone passed to p:environment:setup.";
     };
 
     user = mkOption {
@@ -66,42 +161,94 @@ in {
       description = mdDoc "System user that owns the panel files and runs php-fpm / the queue worker.";
     };
 
-    redisName = mkOption {
-      type    = types.str;
-      default = "pterodactyl";
-      description = mdDoc "Name for the dedicated Redis server instance.";
+    database = {
+      name = mkOption {
+        type    = types.str;
+        default = "pterodactyl";
+        description = mdDoc "MariaDB database name.";
+      };
+
+      user = mkOption {
+        type    = types.str;
+        default = "pterodactyl";
+        description = mdDoc "MariaDB user.";
+      };
+
+      passwordFile = mkOption {
+        type    = types.nullOr types.path;
+        default = null;
+        example = "/run/agenix/ptero-db-password";
+        description = mdDoc "File containing the DB password (no trailing newline). Null = empty password.";
+      };
+
+      host = mkOption {
+        type    = types.str;
+        default = "127.0.0.1";
+        description = mdDoc "MariaDB host address.";
+      };
+
+      port = mkOption {
+        type    = types.port;
+        default = 3306;
+        description = mdDoc "MariaDB port.";
+      };
     };
 
-    dbName = mkOption {
-      type    = types.str;
-      default = "pterodactyl";
-      description = mdDoc "MySQL database name for the panel.";
+    redis = {
+      name = mkOption {
+        type    = types.str;
+        default = "pterodactyl";
+        description = mdDoc "Name for the dedicated Redis server instance.";
+      };
+
+      host = mkOption {
+        type    = types.str;
+        default = "127.0.0.1";
+        description = mdDoc "Redis host address.";
+      };
+
+      port = mkOption {
+        type    = types.port;
+        default = 6379;
+        description = mdDoc "Redis port.";
+      };
     };
 
-    dbUser = mkOption {
-      type    = types.str;
-      default = "pterodactyl";
-      description = mdDoc "MySQL user for the panel.";
-    };
+    admin = {
+      emailFile = mkOption {
+        type    = types.path;
+        example = "/run/agenix/ptero-admin-email";
+        description = mdDoc "File containing the admin e-mail address (no trailing newline). Required.";
+      };
 
-    # Path to an agenix-managed secret containing the DB password (plain text).
-    dbPasswordFile = mkOption {
-      type    = types.nullOr types.path;
-      default = null;
-      example = "/run/agenix/pterodactyl-db-password";
-      description = mdDoc ''
-        Path to a file containing the database password.
-        Use together with agenix or any other secret provider.
-        When null, the password is left empty (only suitable for local dev).
-      '';
+      passwordFile = mkOption {
+        type    = types.path;
+        example = "/run/agenix/ptero-admin-password";
+        description = mdDoc "File containing the admin password, min 8 chars (no trailing newline). Required.";
+      };
+
+      username = mkOption {
+        type    = types.str;
+        default = "admin";
+        description = mdDoc "Username for the initial admin account.";
+      };
+
+      firstName = mkOption {
+        type    = types.str;
+        default = "Panel";
+        description = mdDoc "First name for the initial admin account.";
+      };
+
+      lastName = mkOption {
+        type    = types.str;
+        default = "Admin";
+        description = mdDoc "Last name for the initial admin account.";
+      };
     };
   };
 
-  # ─── Implementation ────────────────────────────────────────────────────────
-
   config = mkIf cfg.enable {
 
-    # ── Users ────────────────────────────────────────────────────────────────
     users.users.${cfg.user} = {
       isSystemUser = true;
       createHome   = true;
@@ -110,60 +257,89 @@ in {
     };
     users.groups.${cfg.user} = {};
 
-    # ── Database (MariaDB) ───────────────────────────────────────────────────
     services.mysql = {
       enable  = true;
       package = pkgs.mariadb;
-      ensureDatabases = [ cfg.dbName ];
-      ensureUsers = [
-        {
-          name = cfg.dbUser;
-          ensurePermissions = {
-            "${cfg.dbName}.*" = "ALL PRIVILEGES";
-          };
-        }
-      ];
+      ensureDatabases = [ cfg.database.name ];
+      ensureUsers = [{
+        name = cfg.database.user;
+        ensurePermissions = { "${cfg.database.name}.*" = "ALL PRIVILEGES"; };
+      }];
     };
 
-    # ── Redis ────────────────────────────────────────────────────────────────
-    services.redis.servers.${cfg.redisName} = {
+    services.redis.servers.${cfg.redis.name} = {
       enable = true;
-      port   = 6379;
+      bind   = cfg.redis.host;
+      port   = cfg.redis.port;
     };
 
-    # ── PHP-FPM ──────────────────────────────────────────────────────────────
-    services.phpfpm.pools.pterodactyl = {
-      user     = cfg.user;
-      phpPackage = pteroPhp;
-      settings = {
-        "listen.owner"             = config.services.nginx.user;
-        "pm"                       = "dynamic";
-        "pm.start_servers"         = 4;
-        "pm.min_spare_servers"     = 4;
-        "pm.max_spare_servers"     = 16;
-        "pm.max_children"          = 64;
-        "pm.max_requests"          = 256;
-        "clear_env"                = false;
-        "catch_workers_output"     = true;
-        "decorate_workers_output"  = false;
-        "php_admin_value[error_log]"  = "stderr";
-        "php_admin_flag[daemonize]"   = "false";
+    systemd.services.pterodactyl-setup = {
+      description = "Pterodactyl panel automated setup";
+      wantedBy    = [ "multi-user.target" ];
+      after       = [ "network-online.target" "mysql.service" "redis-${cfg.redis.name}.service" ];
+      requires    = [ "mysql.service" "redis-${cfg.redis.name}.service" ];
+
+      serviceConfig = {
+        Type            = "oneshot";
+        RemainAfterExit = true;
+        User            = "root";
+        ExecStart       = setupScript;
+        TimeoutStartSec = "10min";
+        PrivateTmp      = true;
       };
     };
 
-    # ── Nginx ────────────────────────────────────────────────────────────────
+    systemd.services.pteroq = {
+      description = "Pterodactyl Queue Worker";
+      after       = [ "pterodactyl-setup.service" "redis-${cfg.redis.name}.service" "mysql.service" ];
+      requires    = [ "pterodactyl-setup.service" "redis-${cfg.redis.name}.service" "mysql.service" ];
+      wantedBy    = [ "multi-user.target" ];
+
+      unitConfig.StartLimitInterval = 180;
+
+      serviceConfig = {
+        User            = cfg.user;
+        Group           = cfg.user;
+        Restart         = "always";
+        RestartSec      = "5s";
+        StartLimitBurst = 30;
+        ExecStart       = "${pteroPhp}/bin/php ${cfg.dataDir}/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3";
+      };
+    };
+
+    systemd.services.phpfpm-pterodactyl = {
+      after    = [ "pterodactyl-setup.service" ];
+      requires = [ "pterodactyl-setup.service" ];
+    };
+
+    services.phpfpm.pools.pterodactyl = {
+      user       = cfg.user;
+      phpPackage = pteroPhp;
+      settings = {
+        "listen.owner"            = config.services.nginx.user;
+        "pm"                      = "dynamic";
+        "pm.start_servers"        = 4;
+        "pm.min_spare_servers"    = 4;
+        "pm.max_spare_servers"    = 16;
+        "pm.max_children"         = 64;
+        "pm.max_requests"         = 256;
+        "clear_env"               = false;
+        "catch_workers_output"    = true;
+        "decorate_workers_output" = false;
+        "php_admin_value[error_log]" = "stderr";
+        "php_admin_flag[daemonize]"  = "false";
+      };
+    };
+
     services.nginx = {
       enable = true;
-
       virtualHosts.${cfg.domain} = mkMerge [
         {
           root = "${cfg.dataDir}/public";
-
           extraConfig = ''
             index index.php;
             charset utf-8;
           '';
-
           locations = {
             "/" = {
               tryFiles = "$uri $uri/ /index.php?$query_string";
@@ -190,44 +366,19 @@ in {
           };
         }
         (mkIf cfg.useACME {
-          enableACME    = true;
-          forceSSL      = true;
+          enableACME = true;
+          forceSSL   = true;
         })
       ];
     };
 
-    # ACME contact e-mail — override in your configuration.nix.
     security.acme = mkIf cfg.useACME {
-      acceptTerms = true;
+      acceptTerms    = true;
       defaults.email = "admin@${cfg.domain}";
     };
 
-    # ── Queue worker (pteroq) ────────────────────────────────────────────────
-    systemd.services.pteroq = {
-      description = "Pterodactyl Queue Worker";
-      after        = [ "redis-${cfg.redisName}.service" "mysql.service" ];
-      requires     = [ "redis-${cfg.redisName}.service" "mysql.service" ];
-      wantedBy     = [ "multi-user.target" ];
-
-      unitConfig.StartLimitInterval = 180;
-
-      serviceConfig = {
-        User       = cfg.user;
-        Group      = cfg.user;
-        Restart    = "always";
-        RestartSec = "5s";
-        StartLimitBurst = 30;
-        ExecStart  = "${pteroPhp}/bin/php ${cfg.dataDir}/artisan queue:work --queue=high,standard,low --sleep=3 --tries=3";
-      };
-    };
-
-    # ── Firewall ─────────────────────────────────────────────────────────────
     networking.firewall.allowedTCPPorts = [ 80 443 ];
 
-    # ── Extra packages (available on the system for manual artisan commands) ─
-    environment.systemPackages = [
-      pteroPhp
-      pteroComposer
-    ];
+    environment.systemPackages = [ pteroPhp pteroComposer ];
   };
 }
